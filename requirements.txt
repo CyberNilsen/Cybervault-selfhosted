@@ -3,3 +3,7 @@ uvicorn
 python-multipart
 python-dotenv
 cryptography
+pyjwt
+sqlalchemy
+databases
+aiosqlite

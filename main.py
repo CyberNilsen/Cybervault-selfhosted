@@ -1,64 +1,68 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from cryptography.fernet import Fernet
-from dotenv import load_dotenv
-import os
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+from database import Base, engine, SessionLocal, User, PasswordEntry
+from models import RegisterModel, LoginModel, PasswordModel
+from utils import encrypt_password, decrypt_password
+from auth import create_token, admin_required_optional, get_current_user
 
-# Load environment variables
-load_dotenv()
-SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
+app = FastAPI()
+Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="CyberVault API")
+# Dependency for DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-# In-memory storage (Gonna fix later)
-users = {}
-passwords = {}
-
-# Encryption key
-cipher = Fernet(SECRET_KEY.encode())
-
-# Models
-class RegisterModel(BaseModel):
-    username: str
-    password: str
-
-class LoginModel(BaseModel):
-    username: str
-    password: str
-
-class PasswordModel(BaseModel):
-    name: str
-    password: str
-
-# Routes
-@app.post("/register")
-def register(user: RegisterModel):
-    if user.username in users:
-        raise HTTPException(status_code=400, detail="User already exists")
-    users[user.username] = user.password
-    passwords[user.username] = []
-    return {"message": "User registered successfully"}
+# User routes
+@app.post("/create-user")
+def create_user(user: RegisterModel, token=Depends(admin_required_optional)):
+    db = SessionLocal()
+    is_first_user = db.query(User).count() == 0
+    new_user = User(
+        username=user.username,
+        password=encrypt_password(user.password),
+        is_admin=is_first_user
+    )
+    db.add(new_user)
+    db.commit()
+    db.close()
+    return {"message": f"User {user.username} created", "is_admin": is_first_user}
 
 @app.post("/login")
-def login(user: LoginModel):
-    if user.username not in users or users[user.username] != user.password:
+def login(user: LoginModel, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.username == user.username).first()
+    if not db_user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    return {"message": "Login successful"}
+    if decrypt_password(db_user.password) != user.password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_token(db_user.username, db_user.is_admin)
+    return {"access_token": token}
 
-@app.post("/passwords/{username}")
-def add_password(username: str, entry: PasswordModel):
-    if username not in users:
-        raise HTTPException(status_code=401, detail="Invalid user")
-    encrypted = cipher.encrypt(entry.password.encode()).decode()
-    passwords[username].append({"name": entry.name, "password": encrypted})
-    return {"message": "Password stored"}
+# Password routes
+@app.post("/passwords")
+def add_password(entry: PasswordModel, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    db_entry = PasswordEntry(
+        name=entry.name,
+        username=entry.username,
+        password=encrypt_password(entry.password),
+        owner_id=user.get("sub")
+    )
+    db.add(db_entry)
+    db.commit()
+    db.refresh(db_entry)
+    return {"message": "Password saved"}
 
-@app.get("/passwords/{username}")
-def get_passwords(username: str):
-    if username not in users:
-        raise HTTPException(status_code=401, detail="Invalid user")
-    decrypted = [
-        {"name": p["name"], "password": cipher.decrypt(p["password"].encode()).decode()}
-        for p in passwords[username]
-    ]
-    return {"passwords": decrypted}
+@app.get("/passwords")
+def get_passwords(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    entries = db.query(PasswordEntry).filter(PasswordEntry.owner_id == user.get("sub")).all()
+    result = []
+    for e in entries:
+        result.append({
+            "name": e.name,
+            "username": e.username,
+            "password": decrypt_password(e.password)
+        })
+    return result
